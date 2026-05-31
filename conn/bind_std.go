@@ -198,6 +198,7 @@ again:
 	var v4conn, v6conn *net.UDPConn
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
+	var v6port int
 
 	v4conn, port, err = listenNet(s.externalControl, "udp4", port)
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
@@ -205,15 +206,24 @@ again:
 	}
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet(s.externalControl, "udp6", port)
-	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
+	v6conn, v6port, err = listenNet(s.externalControl, "udp6", port)
+	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 && v4conn != nil {
 		v4conn.Close()
 		tries++
 		goto again
 	}
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
-		v4conn.Close()
-		return nil, 0, err
+		// Some hosts have IPv6 disabled at the stack level, which surfaces as
+		// WSAEINVAL ("An invalid argument was supplied") on Windows, or assorted
+		// errors elsewhere, rather than EAFNOSUPPORT. If the IPv4 socket came up,
+		// tolerate the IPv6 failure and bind IPv4 only instead of failing the
+		// whole device.
+		if v4conn == nil {
+			return nil, 0, err
+		}
+		v6conn = nil
+	} else if v6conn != nil {
+		port = v6port
 	}
 	var fns []ReceiveFunc
 	if v4conn != nil {
