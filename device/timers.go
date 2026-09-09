@@ -18,31 +18,35 @@ func fastrandn(n uint32) uint32
 
 // A Timer manages time-based aspects of the WireGuard protocol.
 // Timer roughly copies the interface of the Linux kernel's struct timer_list.
+// A Timer's pending state is carried by duration rather than a bool, so that
+// the expiration function can be told which of the (now configurable) AmneziaWG
+// timeout ranges it was actually armed with.
 type Timer struct {
 	*time.Timer
 	modifyingLock sync.RWMutex
 	runningLock   sync.Mutex
-	isPending     bool
+	duration      time.Duration
 }
 
-func (peer *Peer) NewTimer(expirationFunction func(*Peer)) *Timer {
+func (peer *Peer) NewTimer(expirationFunction func(*Peer, time.Duration)) *Timer {
 	timer := &Timer{}
 	timer.Timer = time.AfterFunc(time.Hour, func() {
 		timer.runningLock.Lock()
 		defer timer.runningLock.Unlock()
 
 		timer.modifyingLock.Lock()
-		if !timer.isPending {
+		if timer.duration == 0 {
 			timer.modifyingLock.Unlock()
 			return
 		}
-		timer.isPending = false
+		duration := timer.duration
+		timer.duration = 0
 		timer.modifyingLock.Unlock()
 
 		if pauseManager := peer.device.pauseManager; pauseManager != nil {
 			pauseManager.WaitActive()
 		}
-		expirationFunction(peer)
+		expirationFunction(peer, duration)
 	})
 	timer.Stop()
 	return timer
@@ -50,14 +54,14 @@ func (peer *Peer) NewTimer(expirationFunction func(*Peer)) *Timer {
 
 func (timer *Timer) Mod(d time.Duration) {
 	timer.modifyingLock.Lock()
-	timer.isPending = true
+	timer.duration = d
 	timer.Reset(d)
 	timer.modifyingLock.Unlock()
 }
 
 func (timer *Timer) Del() {
 	timer.modifyingLock.Lock()
-	timer.isPending = false
+	timer.duration = 0
 	timer.Stop()
 	timer.modifyingLock.Unlock()
 }
@@ -72,16 +76,18 @@ func (timer *Timer) DelSync() {
 func (timer *Timer) IsPending() bool {
 	timer.modifyingLock.RLock()
 	defer timer.modifyingLock.RUnlock()
-	return timer.isPending
+	return timer.duration > 0
 }
 
 func (peer *Peer) timersActive() bool {
 	return peer.isRunning.Load() && peer.device != nil && peer.device.isUp()
 }
 
-func expiredRetransmitHandshake(peer *Peer) {
-	if peer.timers.handshakeAttempts.Load() > MaxTimerHandshakes {
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
+func expiredRetransmitHandshake(peer *Peer, d time.Duration) {
+	maxAttempts := peer.timers.maxHandshakeAttempts.Load()
+
+	if peer.timers.handshakeAttempts.Load() > maxAttempts {
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, maxAttempts+2)
 
 		if peer.timersActive() {
 			peer.timers.sendKeepalive.Del()
@@ -96,12 +102,12 @@ func expiredRetransmitHandshake(peer *Peer) {
 		 * of a partial exchange.
 		 */
 		if peer.timersActive() && !peer.timers.zeroKeyMaterial.IsPending() {
-			peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
+			peer.timers.zeroKeyMaterial.Mod(peer.device.keychainExpireTime() * 3)
 		}
 		peer.noteSessionHandshakeStopped()
 	} else {
 		peer.timers.handshakeAttempts.Add(1)
-		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(RekeyTimeout.Seconds()), peer.timers.handshakeAttempts.Load()+1)
+		peer.device.log.Verbosef("%s - Handshake did not complete after %d seconds, retrying (try %d)", peer, int(d.Seconds()), peer.timers.handshakeAttempts.Load()+1)
 
 		/* We clear the endpoint address src address, in case this is the cause of trouble. */
 		peer.markEndpointSrcForClearing()
@@ -110,25 +116,25 @@ func expiredRetransmitHandshake(peer *Peer) {
 	}
 }
 
-func expiredSendKeepalive(peer *Peer) {
+func expiredSendKeepalive(peer *Peer, d time.Duration) {
 	peer.SendKeepalive()
 	if peer.timers.needAnotherKeepalive.Load() {
 		peer.timers.needAnotherKeepalive.Store(false)
 		if peer.timersActive() {
-			peer.timers.sendKeepalive.Mod(KeepaliveTimeout)
+			peer.timers.sendKeepalive.Mod(peer.sendKeepaliveTimeout())
 		}
 	}
 }
 
-func expiredNewHandshake(peer *Peer) {
-	peer.device.log.Verbosef("%s - Retrying handshake because we stopped hearing back after %d seconds", peer, int((KeepaliveTimeout + RekeyTimeout).Seconds()))
+func expiredNewHandshake(peer *Peer, d time.Duration) {
+	peer.device.log.Verbosef("%s - Retrying handshake because we stopped hearing back after %d seconds", peer, int(d.Seconds()))
 	/* We clear the endpoint address src address, in case this is the cause of trouble. */
 	peer.markEndpointSrcForClearing()
 	peer.SendHandshakeInitiation(false)
 }
 
-func expiredZeroKeyMaterial(peer *Peer) {
-	peer.device.log.Verbosef("%s - Removing all keys, since we haven't received a new one in %d seconds", peer, int((RejectAfterTime * 3).Seconds()))
+func expiredZeroKeyMaterial(peer *Peer, d time.Duration) {
+	peer.device.log.Verbosef("%s - Removing all keys, since we haven't received a new one in %d seconds", peer, int(d.Seconds()))
 	peer.ZeroAndFlushAll()
 	if peer.deleteOnIdle {
 		peer.device.log.Verbosef("%s - Removing idle lazy peer", peer)
@@ -140,18 +146,18 @@ func expiredZeroKeyMaterial(peer *Peer) {
 	}
 }
 
-func expiredSession(peer *Peer) {
+func expiredSession(peer *Peer, d time.Duration) {
 	peer.sessionState.Lock()
 	defer peer.sessionState.Unlock()
 	if peer.sessionState.sessionExpires.IsZero() || time.Now().Before(peer.sessionState.sessionExpires) {
 		return
 	}
-	peer.device.log.Verbosef("%s - Session expired after %d seconds", peer, int(RejectAfterTime.Seconds()))
+	peer.device.log.Verbosef("%s - Session expired after %d seconds", peer, int(d.Seconds()))
 	peer.noteSessionStateLocked(PeerSessionExpired)
 }
 
-func expiredPersistentKeepalive(peer *Peer) {
-	if peer.persistentKeepaliveInterval.Load() > 0 {
+func expiredPersistentKeepalive(peer *Peer, d time.Duration) {
+	if !peer.persistentKeepaliveInterval.Load().IsZero() {
 		peer.SendKeepalive()
 	}
 }
@@ -159,7 +165,7 @@ func expiredPersistentKeepalive(peer *Peer) {
 /* Should be called after an authenticated data packet is sent. */
 func (peer *Peer) timersDataSent() {
 	if peer.timersActive() && !peer.timers.newHandshake.IsPending() {
-		peer.timers.newHandshake.Mod(KeepaliveTimeout + RekeyTimeout + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
+		peer.timers.newHandshake.Mod(peer.newHandshakeTimeout() + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
 	}
 }
 
@@ -167,7 +173,7 @@ func (peer *Peer) timersDataSent() {
 func (peer *Peer) timersDataReceived() {
 	if peer.timersActive() {
 		if !peer.timers.sendKeepalive.IsPending() {
-			peer.timers.sendKeepalive.Mod(KeepaliveTimeout)
+			peer.timers.sendKeepalive.Mod(peer.sendKeepaliveTimeout())
 		} else {
 			peer.timers.needAnotherKeepalive.Store(true)
 		}
@@ -191,7 +197,7 @@ func (peer *Peer) timersAnyAuthenticatedPacketReceived() {
 /* Should be called after a handshake initiation message is sent. */
 func (peer *Peer) timersHandshakeInitiated() {
 	if peer.timersActive() {
-		peer.timers.retransmitHandshake.Mod(RekeyTimeout + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
+		peer.timers.retransmitHandshake.Mod(peer.retransmitHandshakeTimeout() + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
 	}
 	peer.noteSessionHandshakeStarted()
 }
@@ -202,6 +208,7 @@ func (peer *Peer) timersHandshakeComplete() {
 		peer.timers.retransmitHandshake.Del()
 	}
 	peer.timers.handshakeAttempts.Store(0)
+	peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttempts())
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.lastHandshakeNano.Store(time.Now().UnixNano())
 }
@@ -209,12 +216,16 @@ func (peer *Peer) timersHandshakeComplete() {
 /* Should be called after an ephemeral key is created, which is before sending a handshake response or after receiving a handshake response. */
 func (peer *Peer) timersSessionDerived() {
 	if peer.timersActive() {
+		// AmneziaWG allows RejectAfterTime to be reconfigured, so the session
+		// lifetime and its timers track keychainExpireTime rather than the
+		// compile-time constant.
+		keychainExpire := peer.device.keychainExpireTime()
 		peer.sessionState.Lock()
-		peer.sessionState.sessionExpires = time.Now().Add(RejectAfterTime)
+		peer.sessionState.sessionExpires = time.Now().Add(keychainExpire)
 		peer.noteSessionStateLocked(PeerSessionEstablished)
 		peer.sessionState.Unlock()
-		peer.timers.sessionExpired.Mod(RejectAfterTime)
-		peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
+		peer.timers.sessionExpired.Mod(keychainExpire)
+		peer.timers.zeroKeyMaterial.Mod(keychainExpire * 3)
 	} else {
 		peer.noteSessionState(PeerSessionEstablished)
 	}
@@ -223,8 +234,8 @@ func (peer *Peer) timersSessionDerived() {
 /* Should be called before a packet with authentication -- keepalive, data, or handshake -- is sent, or after one is received. */
 func (peer *Peer) timersAnyAuthenticatedPacketTraversal() {
 	keepalive := peer.persistentKeepaliveInterval.Load()
-	if keepalive > 0 && peer.timersActive() {
-		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive) * time.Second)
+	if !keepalive.IsZero() && peer.timersActive() {
+		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive.PickOne()) * time.Second)
 	}
 }
 
@@ -239,6 +250,7 @@ func (peer *Peer) timersInit() {
 
 func (peer *Peer) timersStart() {
 	peer.timers.handshakeAttempts.Store(0)
+	peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttempts())
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.timers.needAnotherKeepalive.Store(false)
 }
@@ -250,4 +262,105 @@ func (peer *Peer) timersStop() {
 	peer.timers.sessionExpired.DelSync()
 	peer.timers.zeroKeyMaterial.DelSync()
 	peer.timers.persistentKeepalive.DelSync()
+}
+
+// AmneziaWG timing overrides. Each falls back to the WireGuard specification
+// constant when the corresponding range is unset. Where a timeout is compared
+// against an interval rather than armed as a timer, the conservative end of the
+// range is used: the low end when a deadline must not be missed, the high end
+// when material must not be discarded early.
+
+func (peer *Peer) retransmitHandshakeTimeout() time.Duration {
+	timeout := RekeyTimeout
+
+	if t := peer.device.timings.rekeyTimeoutSec.Load(); !t.IsZero() {
+		timeout = time.Duration(t.PickOne()) * time.Second
+	}
+
+	return timeout
+}
+
+func (peer *Peer) sendKeepaliveTimeout() time.Duration {
+	timeout := KeepaliveTimeout
+
+	if t := peer.device.timings.keepaliveTimeoutSec.Load(); !t.IsZero() {
+		timeout = time.Duration(t.PickOne()) * time.Second
+	}
+
+	return timeout
+}
+
+func (peer *Peer) newHandshakeTimeout() time.Duration {
+	keepaliveTimeout := KeepaliveTimeout
+	rekeyTimeout := RekeyTimeout
+
+	if t := peer.device.timings.keepaliveTimeoutSec.Load(); !t.IsZero() {
+		keepaliveTimeout = time.Duration(t.Hi()) * time.Second
+	}
+	if t := peer.device.timings.rekeyTimeoutSec.Load(); !t.IsZero() {
+		rekeyTimeout = time.Duration(t.PickOne()) * time.Second
+	}
+
+	return keepaliveTimeout + rekeyTimeout
+}
+
+func (device *Device) keyRefreshTimeoutSending() time.Duration {
+	rekeyAfterTime := RekeyAfterTime
+
+	if t := device.timings.rekeyAfterTimeSec.Load(); !t.IsZero() {
+		rekeyAfterTime = time.Duration(t.PickOne()) * time.Second
+	}
+
+	return rekeyAfterTime
+}
+
+func (device *Device) keyRefreshTimeoutReceiving() time.Duration {
+	rejectAfterTime := RejectAfterTime
+	keepaliveTimeout := KeepaliveTimeout
+	rekeyTimeout := RekeyTimeout
+
+	if t := device.timings.rejectAfterTimeSec.Load(); !t.IsZero() {
+		rejectAfterTime = time.Duration(t.PickOne()) * time.Second
+	}
+	if t := device.timings.keepaliveTimeoutSec.Load(); !t.IsZero() {
+		keepaliveTimeout = time.Duration(t.Lo()) * time.Second
+	}
+	if t := device.timings.rekeyTimeoutSec.Load(); !t.IsZero() {
+		rekeyTimeout = time.Duration(t.Lo()) * time.Second
+	}
+
+	if timeout := rejectAfterTime - keepaliveTimeout - rekeyTimeout; timeout > 0 {
+		return timeout
+	}
+	return 0
+}
+
+func (device *Device) keychainExpireTime() time.Duration {
+	rejectAfterTime := RejectAfterTime
+
+	if t := device.timings.rejectAfterTimeSec.Load(); !t.IsZero() {
+		rejectAfterTime = time.Duration(t.Hi()) * time.Second
+	}
+
+	return rejectAfterTime
+}
+
+func (device *Device) rekeyMinTimeout() time.Duration {
+	rekeyTimeout := RekeyTimeout
+
+	if t := device.timings.rekeyTimeoutSec.Load(); !t.IsZero() {
+		rekeyTimeout = time.Duration(t.Lo()) * time.Second
+	}
+
+	return rekeyTimeout
+}
+
+func (device *Device) maxHandshakeAttempts() uint32 {
+	res := uint32(MaxTimerHandshakes)
+
+	if t := device.timings.maxHandshakeAttempts.Load(); !t.IsZero() {
+		res = t.PickOne()
+	}
+
+	return res
 }

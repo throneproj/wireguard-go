@@ -24,6 +24,10 @@ const (
 	CookieRefreshTime       = time.Second * 120
 	HandshakeInitationRate  = time.Second / 50
 	PaddingMultiple         = 16
+	// DefaultUdpWindow is the initial upper bound, in bytes, used to size
+	// AmneziaWG random trailers before any packet has been observed from a
+	// peer. It grows to the largest packet actually seen on the session.
+	DefaultUdpWindow = 500
 )
 
 const (

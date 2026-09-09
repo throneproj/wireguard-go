@@ -100,6 +100,56 @@ type Device struct {
 	closed       chan struct{}
 	log          *Logger
 	pauseManager pause.Manager
+
+	// AmneziaWG obfuscation configuration. All fields are zero/default when no
+	// amnezia options are provided, in which case the device behaves exactly
+	// like upstream wireguard-go.
+	junk struct {
+		min   atomic.Uint32
+		max   atomic.Uint32
+		count atomic.Uint32
+	}
+
+	headers struct {
+		init      AtomicUintRange
+		cookie    AtomicUintRange
+		response  AtomicUintRange
+		transport AtomicUintRange
+	}
+
+	paddings struct {
+		init      atomic.Uint32
+		response  atomic.Uint32
+		cookie    atomic.Uint32
+		transport atomic.Uint32
+	}
+
+	ipackets [5]*obfChain
+
+	headerProtection struct {
+		sync.RWMutex
+		// enabled mirrors "key is set" so the per-packet fast path can skip
+		// the lock entirely when header protection is not configured.
+		enabled atomic.Bool
+		key     HeaderCipherKey
+	}
+
+	contentPaddingAddition AtomicUintRange
+
+	timings struct {
+		rekeyAfterTimeSec    AtomicUintRange
+		rekeyTimeoutSec      AtomicUintRange
+		rejectAfterTimeSec   AtomicUintRange
+		keepaliveTimeoutSec  AtomicUintRange
+		maxHandshakeAttempts AtomicUintRange
+	}
+
+	// randomTrailers appends a random number of bytes to every emitted
+	// message, so that packet sizes no longer identify the message type.
+	randomTrailers atomic.Bool
+	// disableCookies suppresses all cookie replies, so that an under-load
+	// device stays silent rather than answering with a fixed-size message.
+	disableCookies atomic.Bool
 }
 
 // deviceState represents the state of a Device.
@@ -202,7 +252,7 @@ func (device *Device) upLocked() error {
 	device.peers.RUnlock()
 	for _, peer := range peers {
 		peer.Start()
-		if peer.persistentKeepaliveInterval.Load() > 0 {
+		if !peer.persistentKeepaliveInterval.Load().IsZero() {
 			peer.SendKeepalive()
 		}
 	}
@@ -317,6 +367,18 @@ func NewDevice(ctx context.Context, tunDevice tun.Device, bind conn.Bind, logger
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
+
+	// Default magic headers map each message type to its canonical constant,
+	// so detection/generation is a no-op until H1-H4 are configured.
+	var rang UintRange
+	rang.FromUint32(MessageInitiationType, MessageInitiationType)
+	device.headers.init.Store(rang)
+	rang.FromUint32(MessageResponseType, MessageResponseType)
+	device.headers.response.Store(rang)
+	rang.FromUint32(MessageCookieReplyType, MessageCookieReplyType)
+	device.headers.cookie.Store(rang)
+	rang.FromUint32(MessageTransportType, MessageTransportType)
+	device.headers.transport.Store(rang)
 
 	device.PopulatePools()
 
@@ -639,10 +701,13 @@ func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
 	// peers.RLock across that path would invert the
 	// staticIdentity < peers hierarchy (see lock-ordering.md).
 	var peers []*Peer
+
+	timeout := device.keychainExpireTime()
+
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
 		peer.keypairs.RLock()
-		sendKeepalive := peer.keypairs.current != nil && !peer.keypairs.current.created.Add(RejectAfterTime).Before(time.Now())
+		sendKeepalive := peer.keypairs.current != nil && !peer.keypairs.current.created.Add(timeout).Before(time.Now())
 		peer.keypairs.RUnlock()
 		if sendKeepalive {
 			peers = append(peers, peer)

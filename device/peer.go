@@ -58,6 +58,7 @@ type Peer struct {
 		zeroKeyMaterial         *Timer
 		persistentKeepalive     *Timer
 		handshakeAttempts       atomic.Uint32
+		maxHandshakeAttempts    atomic.Uint32
 		needAnotherKeepalive    atomic.Bool
 		sentLastMinuteHandshake atomic.Bool
 	}
@@ -81,7 +82,12 @@ type Peer struct {
 
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
-	persistentKeepaliveInterval atomic.Uint32
+	persistentKeepaliveInterval AtomicUintRange
+
+	// udpWindow is the largest packet size observed on this session, and the
+	// upper bound AmneziaWG random trailers are sized against so that padded
+	// packets stay within the size distribution the path already carries.
+	udpWindow atomic.Uint32
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
@@ -103,6 +109,8 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 
 	// create peer
 	peer := new(Peer)
+
+	peer.udpWindow.Store(DefaultUdpWindow)
 
 	peer.cookieGenerator.Init(pk)
 	peer.device = device
@@ -245,7 +253,7 @@ func (peer *Peer) Start() {
 	peer.queuedOutboundPackets.Store(0)
 
 	peer.handshake.mutex.Lock()
-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
+	peer.handshake.lastSentHandshake = time.Now().Add(-(peer.device.rekeyMinTimeout() + time.Second))
 	peer.handshake.mutex.Unlock()
 
 	peer.device.queue.encryption.wg.Add(1) // keep encryption queue open for our writes
@@ -311,7 +319,7 @@ func (peer *Peer) ExpireCurrentKeypairs() {
 	handshake.mutex.Lock()
 	peer.device.indexTable.Delete(handshake.localIndex)
 	handshake.Clear()
-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
+	peer.handshake.lastSentHandshake = time.Now().Add(-(peer.device.rekeyMinTimeout() + time.Second))
 	handshake.mutex.Unlock()
 
 	keypairs := &peer.keypairs
@@ -400,6 +408,10 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	defer peer.endpoint.Unlock()
 	if peer.endpoint.disableRoaming {
 		return
+	}
+	if peer.endpoint.val != endpoint {
+		// A new path has its own size distribution; start observing afresh.
+		peer.udpWindow.Store(DefaultUdpWindow)
 	}
 	peer.endpoint.clearSrcOnTx = false
 	peer.endpoint.val = endpoint
