@@ -385,13 +385,17 @@ func (s *StdNetBind) receiveIP(
 		}
 		numMsgs = 1
 	}
+	// Only strip the reserved field when the reserved-bytes feature is actually
+	// in use. Leaving these bytes intact otherwise keeps AmneziaWG magic headers
+	// (which occupy this region) readable on the receive path.
+	clearReserved := len(s.reservedForEndpoint) > 0
 	for i := 0; i < numMsgs; i++ {
 		msg := &(*msgs)[i]
 		sizes[i] = msg.N
 		if sizes[i] == 0 {
 			continue
 		}
-		if msg.N > 3 {
+		if clearReserved && msg.N > 3 {
 			common.ClearArray(bufs[i][1:4])
 		}
 		ep := &StdNetEndpoint{AddrPort: M.AddrPortFromNet(msg.Addr)} // TODO: remove allocation
