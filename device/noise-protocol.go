@@ -6,6 +6,7 @@
 package device
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/tai64n"
 	"golang.org/x/crypto/blake2s"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/poly1305"
 )
@@ -54,6 +56,7 @@ const (
 )
 
 const (
+	MessageUnknownType     = 0
 	MessageInitiationType  = 1
 	MessageResponseType    = 2
 	MessageCookieReplyType = 3
@@ -288,7 +291,7 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 	handshake.mixHash(handshake.remoteStatic[:])
 
 	msg := MessageInitiation{
-		Type:      MessageInitiationType,
+		Type:      device.headers.init.Load().PickOne(),
 		Ephemeral: handshake.localEphemeral.publicKey(),
 	}
 
@@ -471,7 +474,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 	}
 
 	var msg MessageResponse
-	msg.Type = MessageResponseType
+	msg.Type = device.headers.response.Load().PickOne()
 	msg.Sender = handshake.localIndex
 	msg.Receiver = handshake.remoteIndex
 
@@ -729,4 +732,52 @@ func (peer *Peer) ReceivedWithKeypair(receivedKeypair *Keypair) bool {
 	keypairs.current = keypairs.next.Load()
 	keypairs.next.Store(nil)
 	return true
+}
+
+// JunkPackets builds the AmneziaWG Jc junk packets, each of a random size in
+// [Jmin, Jmax). Every buffer carries the encapsulating transport prefix
+// expected by conn.Bind.Send.
+func (device *Device) JunkPackets() [][]byte {
+	count := device.junk.count.Load()
+	if count == 0 {
+		return nil
+	}
+
+	min := device.junk.min.Load()
+	max := device.junk.max.Load()
+	if max < min {
+		max = min
+	}
+
+	bufs := make([][]byte, 0, count)
+	for i := uint32(0); i < count; i++ {
+		buf := make([]byte, MessageEncapsulatingTransportSize+min+fastrandn(max-min))
+		rand.Read(buf[MessageEncapsulatingTransportSize:])
+		bufs = append(bufs, buf)
+	}
+
+	return bufs
+}
+
+// HeaderProtectionCipher returns the cipher that masks the low-entropy header
+// fields WireGuard leaves in the clear, keyed by the device header protection
+// key and nonced with the leading bytes of the packet's own S1-S4 crypto
+// padding. It returns a nil cipher (and no error) when header protection is not
+// configured, which is what keeps the callers' fast paths allocation-free.
+func (device *Device) HeaderProtectionCipher(salt []byte) (*chacha20.Cipher, error) {
+	if !device.headerProtection.enabled.Load() {
+		return nil, nil
+	}
+
+	device.headerProtection.RLock()
+	defer device.headerProtection.RUnlock()
+
+	if device.headerProtection.key.IsZero() {
+		return nil, nil
+	}
+	if len(salt) < HeaderCipherNonceSize {
+		return nil, errors.New("crypto padding is smaller than the header protection nonce")
+	}
+
+	return chacha20.NewUnauthenticatedCipher(device.headerProtection.key[:], salt[:HeaderCipherNonceSize])
 }
