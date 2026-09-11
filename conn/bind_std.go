@@ -285,7 +285,7 @@ again:
 				return 0, err
 			}
 			sizes[0] = dataLength
-			if dataLength > 3 {
+			if len(s.reservedForEndpoint) > 0 && hasReservedField(bufs[0][:dataLength]) {
 				common.ClearArray(bufs[0][1:4])
 			}
 			endpoints[0] = &StdNetEndpoint{AddrPort: source}
@@ -395,7 +395,7 @@ func (s *StdNetBind) receiveIP(
 		if sizes[i] == 0 {
 			continue
 		}
-		if clearReserved && msg.N > 3 {
+		if clearReserved && hasReservedField(bufs[i][:msg.N]) {
 			common.ClearArray(bufs[i][1:4])
 		}
 		ep := &StdNetEndpoint{AddrPort: M.AddrPortFromNet(msg.Addr)} // TODO: remove allocation
@@ -529,7 +529,7 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint, offset int) error {
 	s.reservedAccess.RUnlock()
 	if reservedLoaded {
 		for _, buf := range bufs {
-			if len(buf) > offset+3 {
+			if canSetReserved(buf[offset:]) {
 				copy(buf[offset+1:offset+4], reserved[:])
 			}
 		}
@@ -580,6 +580,19 @@ func (s *StdNetBind) SetReservedForEndpoint(destination netip.AddrPort, reserved
 	s.reservedAccess.Lock()
 	s.reservedForEndpoint[destination] = reserved
 	s.reservedAccess.Unlock()
+}
+
+// canSetReserved reports whether b is an outgoing WireGuard message with the
+// default type header, whose zero bytes 1..3 carry the reserved value. AmneziaWG
+// junk and signature packets share the send batch and must stay untouched.
+func canSetReserved(b []byte) bool {
+	return len(b) > 3 && b[0] >= 1 && b[0] <= 4 && b[1] == 0 && b[2] == 0 && b[3] == 0
+}
+
+// hasReservedField reports whether b is an incoming WireGuard message whose
+// bytes 1..3 may carry the peer's reserved value.
+func hasReservedField(b []byte) bool {
+	return len(b) > 3 && b[0] >= 1 && b[0] <= 4
 }
 
 func (s *StdNetBind) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message) error {
