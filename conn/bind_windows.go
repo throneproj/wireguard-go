@@ -461,7 +461,7 @@ func (bind *WinRingBind) receiveIPv4(bufs [][]byte, sizes []int, eps []Endpoint)
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
 	n, ep, err := bind.v4.Receive(bufs[0], &bind.isOpen)
-	if n > 3 {
+	if len(bind.reservedForEndpoint) > 0 && hasReservedField(bufs[0][:n]) {
 		common.ClearArray(bufs[0][1:4])
 	}
 	sizes[0] = n
@@ -473,7 +473,7 @@ func (bind *WinRingBind) receiveIPv6(bufs [][]byte, sizes []int, eps []Endpoint)
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
 	n, ep, err := bind.v6.Receive(bufs[0], &bind.isOpen)
-	if n > 3 {
+	if len(bind.reservedForEndpoint) > 0 && hasReservedField(bufs[0][:n]) {
 		common.ClearArray(bufs[0][1:4])
 	}
 	sizes[0] = n
@@ -542,7 +542,7 @@ func (bind *WinRingBind) Send(bufs [][]byte, endpoint Endpoint, offset int) erro
 	defer bind.mu.RUnlock()
 	for _, buf := range bufs {
 		buf = buf[offset:]
-		if len(buf) > 3 {
+		if canSetReserved(buf) {
 			reserved, loaded := bind.reservedForEndpoint[*endpoint.(*WinRingEndpoint)]
 			if loaded {
 				copy(buf[1:4], reserved[:])
