@@ -1032,7 +1032,10 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	err := peer.SendBuffers(scratch)
+	var err error
+	if len(scratch) > 0 {
+		err = peer.SendBuffers(scratch)
+	}
 	if dataSent {
 		peer.timersDataSent()
 	}

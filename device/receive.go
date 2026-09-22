@@ -179,6 +179,9 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				packet = packet[:msgSize]
 			}
 
+			if len(packet) < 4 {
+				continue
+			}
 			if cip != nil {
 				applyHash(packet[:4], packet[:4], typeHash)
 			}

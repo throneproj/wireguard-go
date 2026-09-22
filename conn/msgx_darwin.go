@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/sagernet/sing/common"
 	M "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
@@ -182,6 +183,12 @@ var sendMsgXPool = sync.Pool{New: func() any {
 // sendMsgX sends msgs with a single syscall, over a connected socket when the
 // bind has one and by addressing every message otherwise.
 func (s *StdNetBind) sendMsgX(conn *net.UDPConn, msgs []ipv6.Message) error {
+	// AmneziaWG header-protection failures nil out every packet in a batch;
+	// RoutineSequentialSender then calls Send with an empty slice. Guard here
+	// so msgs[0] / &buffer[0] cannot panic the whole process.
+	if len(msgs) == 0 {
+		return nil
+	}
 	var (
 		rawConn syscall.RawConn
 		isV6    bool
@@ -307,12 +314,15 @@ func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc,
 			return 0, errno
 		}
 		numMsgs := int(n)
+		// Only strip the reserved field when the reserved-bytes feature is actually
+		// in use. Leaving these bytes intact otherwise keeps AmneziaWG header-
+		// protection nonces (leading S1-S4 crypto padding) and magic headers
+		// readable on the receive path.
+		clearReserved := len(s.reservedForEndpoint) > 0
 		for i := 0; i < numMsgs; i++ {
 			sizes[i] = int(state.hdrs[i].DataLen)
-			if sizes[i] > 3 {
-				bufs[i][1] = 0
-				bufs[i][2] = 0
-				bufs[i][3] = 0
+			if clearReserved && hasReservedField(bufs[i][:sizes[i]]) {
+				common.ClearArray(bufs[i][1:4])
 			}
 			if connectedEndpoint != nil {
 				eps[i] = connectedEndpoint
