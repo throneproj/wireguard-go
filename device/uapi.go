@@ -259,6 +259,12 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
 		if key == "public_key" {
 			if deviceConfig {
 				deviceConfig = false
+				// Apply staged AmneziaWG device settings before any peer is
+				// started; otherwise SendKeepalive encrypts with S4=0 while a
+				// later mergeWithDevice still holds the header-protection key.
+				if err := ipcDev.mergeWithDevice(device); err != nil {
+					return err
+				}
 			}
 			peer.handlePostConfig()
 			// Load/create the peer we are now configuring.
@@ -566,6 +572,16 @@ func (d *ipcSetDevice) mergeWithDevice(device *Device) error {
 		}
 	}
 
+	// Encryption workers read paddings via atomics without holding this lock,
+	// so never leave a window where header protection is enabled while any
+	// S1-S4 padding is shorter than the nonce (that path drops packets and,
+	// before the empty-batch guard, panicked sendMsgX).
+	enableHP := !d.headerProtectionKey.IsZero()
+	if !enableHP {
+		device.headerProtection.enabled.Store(false)
+		device.headerProtection.key = HeaderCipherKey{}
+	}
+
 	device.log.Verbosef("UAPI: Updating magic headers")
 	device.headers.init.Store(d.headers.init)
 	device.headers.response.Store(d.headers.response)
@@ -579,8 +595,10 @@ func (d *ipcSetDevice) mergeWithDevice(device *Device) error {
 	device.paddings.transport.Store(d.paddings.transport)
 
 	device.log.Verbosef("UAPI: Updating header protection key")
-	device.headerProtection.key = d.headerProtectionKey
-	device.headerProtection.enabled.Store(!d.headerProtectionKey.IsZero())
+	if enableHP {
+		device.headerProtection.key = d.headerProtectionKey
+		device.headerProtection.enabled.Store(true)
+	}
 
 	return nil
 }
