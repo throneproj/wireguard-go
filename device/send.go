@@ -436,6 +436,19 @@ func (device *Device) RoutineReadFromTUN() {
 
 		// read packets
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
+		if current := device.paddings.transport.Load(); current != padding {
+			// AmneziaWG S4 changed while blocked in Read: move the packets to
+			// the layout of the S4 now in effect, dropping any that no longer fit.
+			shifted := MessageEncapsulatingTransportSize + int(current) + MessageTransportHeaderSize
+			for i := 0; i < count; i++ {
+				if sizes[i] < 1 || shifted+sizes[i] > len(bufs[i]) {
+					sizes[i] = 0
+					continue
+				}
+				copy(bufs[i][shifted:], bufs[i][offset:offset+sizes[i]])
+			}
+			padding, offset = current, shifted
+		}
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
 				continue
