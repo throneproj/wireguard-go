@@ -567,7 +567,7 @@ func gatherPacketBytes(packetSlices [][]byte, offset int, destination []byte) bo
 	return false
 }
 
-func (device *Device) newInputElement(packetSlices ...[]byte) *QueueOutboundElement {
+func (device *Device) newInputElement(peer *Peer, packetSlices ...[]byte) *QueueOutboundElement {
 	var totalLength int
 	for _, packetSlice := range packetSlices {
 		totalLength += len(packetSlice)
@@ -578,6 +578,11 @@ func (device *Device) newInputElement(packetSlices ...[]byte) *QueueOutboundElem
 	allocLength := MessageEncapsulatingTransportSize + int(padding) + MessageTransportHeaderSize + totalLength + PaddingMultiple + chacha20poly1305.Overhead
 	if allocLength > MaxMessageSize {
 		return nil
+	}
+	// AmneziaWG content padding and random trailers can add more than the
+	// multiple-of-16 padding reserved above.
+	if extra := peer.maxPaddingAddition(totalLength + MinMessageSize + int(padding)); extra > PaddingMultiple {
+		allocLength = min(allocLength-PaddingMultiple+extra, MaxMessageSize)
 	}
 	elem := device.GetOutboundElement()
 	elem.buffer = device.GetOutboundBuffer(allocLength)
@@ -606,7 +611,7 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 		if peer.stagedPackets.Load() >= maxStagedPackets || peer.queuedOutboundPackets.Load() >= maxQueuedOutboundPackets {
 			continue
 		}
-		elem := device.newInputElement(packetRef.PacketSlices...)
+		elem := device.newInputElement(peer, packetRef.PacketSlices...)
 		if elem == nil {
 			continue
 		}
@@ -643,7 +648,7 @@ func (peer *Peer) WritePackets(packets [][]byte) {
 		}
 		elemsForPeer := device.GetOutboundElementsContainer()
 		for _, packet := range batch {
-			elem := device.newInputElement(packet)
+			elem := device.newInputElement(peer, packet)
 			if elem != nil {
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
 			}
@@ -878,6 +883,21 @@ func (peer *Peer) randomTrailer(packetSize int) int {
 	return int(fastrandn(uint32(udpWindow - packetSize)))
 }
 
+// maxPaddingAddition returns the most content padding RoutineEncryption can
+// currently add to a transport message whose on-the-wire size is packetSize,
+// or -1 when neither AmneziaWG padding feature is configured.
+func (peer *Peer) maxPaddingAddition(packetSize int) int {
+	addition := peer.device.contentPaddingAddition.Load()
+	if addition.IsZero() && !peer.device.randomTrailers.Load() {
+		return -1
+	}
+	space := max(int(peer.udpWindow.Load())-packetSize, 0)
+	if !addition.IsZero() && addition.Hi() < uint32(space) {
+		return int(addition.Hi())
+	}
+	return space
+}
+
 // observeUdpWindow grows the peer's observed maximum packet size, which bounds
 // the random trailers appended to subsequent messages.
 func (peer *Peer) observeUdpWindow(size uint32) {
@@ -948,10 +968,19 @@ func (device *Device) RoutineEncryption(id int) {
 			// packet and Seal encrypts in place at contentOffset either way.
 			// Room is reserved for the tag Seal appends.
 			if room := len(elem.buffer) - contentOffset - poly1305.TagSize - contentSize; paddingSize > room {
-				paddingSize = room
-				if paddingSize < 0 {
-					paddingSize = 0
+				if len(elem.buffer) < MaxMessageSize {
+					// Injected elements are sized for the padding allowed when
+					// they were created; the peer's window or the padding
+					// settings have grown since, so move to a larger buffer.
+					buffer := device.GetOutboundBuffer(min(contentOffset+contentSize+paddingSize+poly1305.TagSize, MaxMessageSize))
+					copy(buffer, elem.buffer[:contentOffset+contentSize])
+					device.PutOutboundBuffer(elem.buffer)
+					elem.buffer = buffer
+					crypt = buffer[MessageEncapsulatingTransportSize:headerOffset]
+					header = buffer[headerOffset:contentOffset]
+					room = len(buffer) - contentOffset - poly1305.TagSize - contentSize
 				}
+				paddingSize = min(paddingSize, max(room, 0))
 			}
 			elem.packet = elem.buffer[contentOffset : contentOffset+contentSize+paddingSize]
 			for i := contentSize; i < len(elem.packet); i++ {
