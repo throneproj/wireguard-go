@@ -77,6 +77,7 @@ type afWinRingBind struct {
 type WinRingBind struct {
 	externalControl     control.Func
 	reservedForEndpoint map[WinRingEndpoint][3]uint8
+	hasReserved         atomic.Bool
 
 	v4, v6 afWinRingBind
 	mu     sync.RWMutex
@@ -461,7 +462,7 @@ func (bind *WinRingBind) receiveIPv4(bufs [][]byte, sizes []int, eps []Endpoint)
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
 	n, ep, err := bind.v4.Receive(bufs[0], &bind.isOpen)
-	if len(bind.reservedForEndpoint) > 0 && hasReservedField(bufs[0][:n]) {
+	if bind.hasReserved.Load() && hasReservedField(bufs[0][:n]) {
 		common.ClearArray(bufs[0][1:4])
 	}
 	sizes[0] = n
@@ -473,7 +474,7 @@ func (bind *WinRingBind) receiveIPv6(bufs [][]byte, sizes []int, eps []Endpoint)
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
 	n, ep, err := bind.v6.Receive(bufs[0], &bind.isOpen)
-	if len(bind.reservedForEndpoint) > 0 && hasReservedField(bufs[0][:n]) {
+	if bind.hasReserved.Load() && hasReservedField(bufs[0][:n]) {
 		common.ClearArray(bufs[0][1:4])
 	}
 	sizes[0] = n
@@ -574,6 +575,7 @@ func (bind *WinRingBind) SetReservedForEndpoint(destination netip.AddrPort, rese
 		panic(E.Cause(err, "parse destination as WinRingEndpoint"))
 	}
 	bind.reservedForEndpoint[*endpoint.(*WinRingEndpoint)] = reserved
+	bind.hasReserved.Store(true)
 }
 
 func (s *StdNetBind) BindSocketToInterface4(interfaceIndex uint32, blackhole bool) error {

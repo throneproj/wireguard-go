@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/sagernet/sing/common"
@@ -43,6 +44,9 @@ type StdNetBind struct {
 	onWrite             func(size int)
 	reservedAccess      sync.RWMutex
 	reservedForEndpoint map[netip.AddrPort][3]uint8
+	// hasReserved reports len(reservedForEndpoint) > 0 to the receive path
+	// without taking reservedAccess; entries are never removed.
+	hasReserved atomic.Bool
 
 	mu            sync.Mutex // protects all fields except as specified
 	ipv4          *net.UDPConn
@@ -285,7 +289,7 @@ again:
 				return 0, err
 			}
 			sizes[0] = dataLength
-			if len(s.reservedForEndpoint) > 0 && hasReservedField(bufs[0][:dataLength]) {
+			if s.hasReserved.Load() && hasReservedField(bufs[0][:dataLength]) {
 				common.ClearArray(bufs[0][1:4])
 			}
 			endpoints[0] = &StdNetEndpoint{AddrPort: source}
@@ -388,7 +392,7 @@ func (s *StdNetBind) receiveIP(
 	// Only strip the reserved field when the reserved-bytes feature is actually
 	// in use. Leaving these bytes intact otherwise keeps AmneziaWG magic headers
 	// (which occupy this region) readable on the receive path.
-	clearReserved := len(s.reservedForEndpoint) > 0
+	clearReserved := s.hasReserved.Load()
 	for i := 0; i < numMsgs; i++ {
 		msg := &(*msgs)[i]
 		sizes[i] = msg.N
@@ -579,6 +583,7 @@ retry:
 func (s *StdNetBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
 	s.reservedAccess.Lock()
 	s.reservedForEndpoint[destination] = reserved
+	s.hasReserved.Store(true)
 	s.reservedAccess.Unlock()
 }
 

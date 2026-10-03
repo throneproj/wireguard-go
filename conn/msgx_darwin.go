@@ -322,7 +322,7 @@ func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc,
 		// in use. Leaving these bytes intact otherwise keeps AmneziaWG header-
 		// protection nonces (leading S1-S4 crypto padding) and magic headers
 		// readable on the receive path.
-		clearReserved := len(s.reservedForEndpoint) > 0
+		clearReserved := s.hasReserved.Load()
 		for i := 0; i < numMsgs; i++ {
 			sizes[i] = int(state.hdrs[i].DataLen)
 			if clearReserved && hasReservedField(bufs[i][:sizes[i]]) {
