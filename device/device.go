@@ -870,8 +870,12 @@ func (device *Device) BindUpdate() error {
 	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
 	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
 	batchSize := netc.bind.BatchSize()
+	initialBatchSize := batchSize
+	if sizer, ok := netc.bind.(conn.InitialBatchSizer); ok {
+		initialBatchSize = min(sizer.InitialBatchSize(), batchSize)
+	}
 	for _, fn := range recvFns {
-		go device.RoutineReceiveIncoming(batchSize, fn)
+		go device.RoutineReceiveIncoming(initialBatchSize, batchSize, fn)
 	}
 
 	device.log.Verbosef("UDP bind has been updated")

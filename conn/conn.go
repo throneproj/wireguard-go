@@ -75,6 +75,14 @@ type PeekLookAtSocketFd interface {
 	PeekLookAtSocketFd6() (fd int, err error)
 }
 
+// InitialBatchSizer is implemented by Bind objects whose ReceiveFuncs accept
+// fewer packets than BatchSize. A receiver starts with InitialBatchSize
+// buffers and grows to BatchSize once a read fills them, so an idle Bind
+// does not pin a full batch of MaxSegmentSize buffers per socket.
+type InitialBatchSizer interface {
+	InitialBatchSize() int
+}
+
 // An Endpoint maintains the source/destination caching for a peer.
 //
 //	dst: the remote address of a peer ("endpoint" in uapi terminology)

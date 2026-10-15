@@ -80,7 +80,7 @@ func (peer *Peer) keepKeyFreshReceiving() {
  * Every time the bind is updated a new routine is started for
  * IPv4 and IPv6 (separately)
  */
-func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.ReceiveFunc) {
+func (device *Device) RoutineReceiveIncoming(initialBatchSize, maxBatchSize int, recv conn.ReceiveFunc) {
 	recvName := recv.PrettyName()
 	defer func() {
 		device.log.Verbosef("Routine: receive incoming %s - stopped", recvName)
@@ -103,9 +103,10 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 		deathSpiral int
 		elemsByPeer = make(map[*Peer]*QueueInboundElementsContainer, maxBatchSize)
 		typeHashBuf [4]byte
+		batchSize   = initialBatchSize
 	)
 
-	for i := range bufsArrs {
+	for i := 0; i < batchSize; i++ {
 		bufsArrs[i] = device.GetMessageBuffer()
 		bufs[i] = bufsArrs[i][:]
 	}
@@ -119,7 +120,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 	}()
 
 	for {
-		count, err = recv(bufs, sizes, endpoints)
+		count, err = recv(bufs[:batchSize], sizes, endpoints)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -294,6 +295,15 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				device.PutInboundElementsContainer(elemsContainer)
 			}
 			delete(elemsByPeer, peer)
+		}
+
+		// A read that fills the batch left datagrams queued behind it: take the full batch from now on.
+		if count == batchSize && batchSize < maxBatchSize {
+			for i := batchSize; i < maxBatchSize; i++ {
+				bufsArrs[i] = device.GetMessageBuffer()
+				bufs[i] = bufsArrs[i][:]
+			}
+			batchSize = maxBatchSize
 		}
 	}
 }

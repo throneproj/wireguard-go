@@ -30,7 +30,10 @@ type EgressProvider interface {
 	ReceiveEgress(buffer []byte) (int, netip.AddrPort, error)
 }
 
-var _ Bind = (*StdNetBind)(nil)
+var (
+	_ Bind              = (*StdNetBind)(nil)
+	_ InitialBatchSizer = (*StdNetBind)(nil)
+)
 
 // StdNetBind implements Bind for all platforms. While Windows has its own Bind
 // (see bind_windows.go), it may fall back to StdNetBind.
@@ -56,9 +59,7 @@ type StdNetBind struct {
 	ipv4RC        syscall.RawConn  // will be nil on non-Darwin
 	ipv6RC        syscall.RawConn  // will be nil on non-Darwin
 	ipv4TxOffload bool
-	ipv4RxOffload bool
 	ipv6TxOffload bool
-	ipv6RxOffload bool
 
 	// these two fields are not guarded by mu
 	udpAddrPool sync.Pool
@@ -231,7 +232,7 @@ again:
 	}
 	var fns []ReceiveFunc
 	if v4conn != nil {
-		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
+		s.ipv4TxOffload, _ = supportsUDPOffload(v4conn)
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
@@ -250,12 +251,12 @@ again:
 			}
 			fns = append(fns, receiveFn)
 		} else {
-			fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
+			fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn))
 		}
 		s.ipv4 = v4conn
 	}
 	if v6conn != nil {
-		s.ipv6TxOffload, s.ipv6RxOffload = supportsUDPOffload(v6conn)
+		s.ipv6TxOffload, _ = supportsUDPOffload(v6conn)
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc
@@ -274,7 +275,7 @@ again:
 			}
 			fns = append(fns, receiveFn)
 		} else {
-			fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
+			fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn))
 		}
 		s.ipv6 = v6conn
 	}
@@ -358,31 +359,32 @@ func (s *StdNetBind) receiveIP(
 	eps []Endpoint,
 ) (n int, err error) {
 	msgs := s.getMessages()
-	for i := range bufs {
-		(*msgs)[i].Buffers[0] = bufs[i]
-		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
-	}
 	defer s.putMessages(msgs)
+	batch := (*msgs)[:len(bufs)]
+	for i := range bufs {
+		batch[i].Buffers[0] = bufs[i]
+		batch[i].OOB = batch[i].OOB[:cap(batch[i].OOB)]
+	}
 	var numMsgs int
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 		if rxOffload {
-			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
-			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
+			readAt := len(batch) - (IdealBatchSize / udpSegmentMaxDatagrams)
+			numMsgs, err = br.ReadBatch(batch[readAt:], 0)
 			if err != nil {
 				return 0, err
 			}
-			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
+			numMsgs, err = splitCoalescedMessages(batch, readAt, getGSOSize)
 			if err != nil {
 				return 0, err
 			}
 		} else {
-			numMsgs, err = br.ReadBatch(*msgs, 0)
+			numMsgs, err = br.ReadBatch(batch, 0)
 			if err != nil {
 				return 0, err
 			}
 		}
 	} else {
-		msg := &(*msgs)[0]
+		msg := &batch[0]
 		msg.N, msg.NN, _, msg.Addr, err = conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
 		if err != nil {
 			return 0, err
@@ -394,7 +396,7 @@ func (s *StdNetBind) receiveIP(
 	// (which occupy this region) readable on the receive path.
 	clearReserved := s.hasReserved.Load()
 	for i := 0; i < numMsgs; i++ {
-		msg := &(*msgs)[i]
+		msg := &batch[i]
 		sizes[i] = msg.N
 		if sizes[i] == 0 {
 			continue
@@ -409,15 +411,23 @@ func (s *StdNetBind) receiveIP(
 	return numMsgs, nil
 }
 
-func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
-	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
-		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
-	}
+func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn) ReceiveFunc {
+	return s.makeReceiveIP(pc, conn)
 }
 
-func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
+func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn) ReceiveFunc {
+	return s.makeReceiveIP(pc, conn)
+}
+
+func (s *StdNetBind) makeReceiveIP(br batchReader, conn *net.UDPConn) ReceiveFunc {
+	var groAttempted, rxOffload bool
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
-		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
+		// A GRO read splits into up to udpSegmentMaxDatagrams datagrams, which only a full batch has room for; receivers never shrink.
+		if !groAttempted && len(bufs) == IdealBatchSize {
+			groAttempted = true
+			rxOffload = enableUDPGRO(conn)
+		}
+		return s.receiveIP(br, conn, rxOffload, bufs, sizes, eps)
 	}
 }
 
@@ -431,6 +441,12 @@ func (s *StdNetBind) BatchSize() int {
 		return msgXBatchSize
 	}
 	return 1
+}
+
+const initialBatchSize = 8
+
+func (s *StdNetBind) InitialBatchSize() int {
+	return min(initialBatchSize, s.BatchSize())
 }
 
 func (s *StdNetBind) Close() error {
@@ -454,9 +470,7 @@ func (s *StdNetBind) Close() error {
 	s.blackhole4 = false
 	s.blackhole6 = false
 	s.ipv4TxOffload = false
-	s.ipv4RxOffload = false
 	s.ipv6TxOffload = false
-	s.ipv6RxOffload = false
 	if err1 != nil {
 		return err1
 	}
