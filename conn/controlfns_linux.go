@@ -86,24 +86,5 @@ func init() {
 			}
 			return err
 		},
-
-		// Attempt to enable UDP_GRO
-		func(network, address string, c syscall.RawConn) error {
-			// Kernels below 5.12 are missing 98184612aca0 ("net:
-			// udp: Add support for getsockopt(..., ..., UDP_GRO,
-			// ..., ...);"), which means we can't read this back
-			// later. We could pipe the return value through to
-			// the rest of the code, but UDP_GRO is kind of buggy
-			// anyway, so just gate this here.
-			major, minor := kernelVersion()
-			if major < 5 || (major == 5 && minor < 12) {
-				return nil
-			}
-
-			c.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_GRO, 1)
-			})
-			return nil
-		},
 	)
 }
