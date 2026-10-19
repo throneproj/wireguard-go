@@ -819,17 +819,30 @@ func (device *Device) scheduleBindUpdate() {
 }
 
 func (device *Device) BindUpdate() error {
+	rekey, err := device.bindUpdate()
+	// The live sessions would otherwise open the new flow with transport
+	// packets; a fresh initiation brings its AmneziaWG prelude first.
+	for _, peer := range rekey {
+		peer.ExpireCurrentKeypairs()
+		peer.SendHandshakeInitiation(false)
+	}
+	return err
+}
+
+// bindUpdate reopens the bind and returns the peers whose live session has to
+// be rekeyed through a handshake on the new socket.
+func (device *Device) bindUpdate() ([]*Peer, error) {
 	device.net.Lock()
 	defer device.net.Unlock()
 
 	// close existing sockets
 	if err := closeBindLocked(device); err != nil {
-		return err
+		return nil, err
 	}
 
 	// open new sockets
 	if !device.isUp() {
-		return nil
+		return nil, nil
 	}
 
 	// bind to new port
@@ -840,28 +853,34 @@ func (device *Device) BindUpdate() error {
 	recvFns, netc.port, err = netc.bind.Open(netc.port)
 	if err != nil {
 		netc.port = 0
-		return err
+		return nil, err
 	}
 
 	netc.netlinkCancel, err = device.startRouteListener(netc.bind)
 	if err != nil {
 		netc.bind.Close()
 		netc.port = 0
-		return err
+		return nil, err
 	}
 
 	// set fwmark
 	if netc.fwmark != 0 {
 		err = netc.bind.SetMark(netc.fwmark)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	// clear cached source addresses
+	var rekey []*Peer
+	prelude := device.hasHandshakePrelude()
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
 		peer.markEndpointSrcForClearing()
+		if prelude && peer.keypairs.Current() != nil {
+			peer.awaitHandshake.Store(true)
+			rekey = append(rekey, peer)
+		}
 	}
 	device.peers.RUnlock()
 
@@ -879,7 +898,21 @@ func (device *Device) BindUpdate() error {
 	}
 
 	device.log.Verbosef("UDP bind has been updated")
-	return nil
+	return rekey, nil
+}
+
+// hasHandshakePrelude reports whether initiations are led by AmneziaWG I1-I5
+// or junk packets, which a DPI-evading configuration needs to open a flow.
+func (device *Device) hasHandshakePrelude() bool {
+	if device.junk.count.Load() > 0 {
+		return true
+	}
+	for _, ipacket := range device.ipackets {
+		if ipacket != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (device *Device) BindClose() error {

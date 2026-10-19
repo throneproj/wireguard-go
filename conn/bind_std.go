@@ -582,9 +582,13 @@ retry:
 		}
 	} else {
 		for i := range bufs {
-			(*msgs)[i].Addr = ua
-			(*msgs)[i].Buffers[0] = bufs[i][offset:]
-			setSrcControl(&(*msgs)[i].OOB, standardEndpoint)
+			msg := &(*msgs)[i]
+			// A failed GSO attempt leaves coalesced iovecs behind, which would
+			// otherwise merge the following datagrams into this one.
+			clear(msg.Buffers[1:])
+			msg.Buffers = append(msg.Buffers[:0], bufs[i][offset:])
+			msg.Addr = ua
+			setSrcControl(&msg.OOB, standardEndpoint)
 		}
 		err = s.send(conn, br, (*msgs)[:len(bufs)])
 	}
