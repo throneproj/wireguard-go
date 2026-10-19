@@ -27,6 +27,11 @@ type Peer struct {
 	rxBytes           atomic.Uint64  // bytes received from peer
 	lastHandshakeNano atomic.Int64   // nano seconds since epoch
 
+	// awaitHandshake holds transport packets back after a rebind until a
+	// handshake message has opened the flow on the new socket, so that it
+	// starts with the AmneziaWG I1-I5 and junk packets of an initiation.
+	awaitHandshake atomic.Bool
+
 	sessionState struct {
 		sync.Mutex
 		current        PeerSessionState
@@ -186,7 +191,41 @@ func (p *Peer) SetPresharedKey(psk NoisePresharedKey) {
 func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	peer.device.net.RLock()
 	defer peer.device.net.RUnlock()
+	return peer.sendBuffersLocked(buffers)
+}
 
+// sendTransportBuffers is SendBuffers for transport packets, which it drops
+// while awaitHandshake holds them back.
+func (peer *Peer) sendTransportBuffers(buffers [][]byte) error {
+	peer.device.net.RLock()
+	defer peer.device.net.RUnlock()
+	if peer.awaitHandshake.Load() {
+		return nil
+	}
+	return peer.sendBuffersLocked(buffers)
+}
+
+// sendHandshakeMessage sends an initiation, led by its AmneziaWG prelude, or a
+// response to the peer's endpoint and to every candidate when there are any.
+// Once it is out the flow on the current socket is open, which releases the
+// transport packets awaitHandshake holds back.
+func (peer *Peer) sendHandshakeMessage(buffers [][]byte, candidates []conn.Endpoint) error {
+	peer.device.net.RLock()
+	defer peer.device.net.RUnlock()
+	var err error
+	if len(candidates) > 0 {
+		err = peer.sendHandshakeBuffersLocked(buffers, candidates)
+	} else {
+		err = peer.sendBuffersLocked(buffers)
+	}
+	if err == nil {
+		peer.awaitHandshake.Store(false)
+	}
+	return err
+}
+
+// sendBuffersLocked is SendBuffers for a caller holding the net read lock.
+func (peer *Peer) sendBuffersLocked(buffers [][]byte) error {
 	if peer.device.isClosed() {
 		return nil
 	}
@@ -203,7 +242,7 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	}
 	peer.endpoint.Unlock()
 
-	err := peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize)
+	err := peer.device.gsoFallbackResult(peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize))
 	if err == nil {
 		var totalLen uint64
 		for _, b := range buffers {
@@ -212,6 +251,17 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		peer.txBytes.Add(totalLen)
 	} else if errors.Is(err, conn.ErrRebindRequired) {
 		peer.device.scheduleBindUpdate()
+	}
+	return err
+}
+
+// gsoFallbackResult returns the result of a send that the bind already
+// retried without UDP GSO, which is all a caller needs to know.
+func (device *Device) gsoFallbackResult(err error) error {
+	var errGSO conn.ErrUDPGSODisabled
+	if errors.As(err, &errGSO) {
+		device.log.Verbosef(err.Error())
+		return errGSO.RetryErr
 	}
 	return err
 }
@@ -446,12 +496,10 @@ func (peer *Peer) resolveEndpoints() []conn.Endpoint {
 	return peer.endpoint.candidates
 }
 
-// sendHandshakeBuffers sends buffers to the peer's current endpoint and every
-// candidate. It succeeds when at least one endpoint accepted the send.
-func (peer *Peer) sendHandshakeBuffers(buffers [][]byte, candidates []conn.Endpoint) error {
-	peer.device.net.RLock()
-	defer peer.device.net.RUnlock()
-
+// sendHandshakeBuffersLocked sends buffers to the peer's current endpoint and
+// every candidate. It succeeds when at least one endpoint accepted the send.
+// The caller must hold the net read lock.
+func (peer *Peer) sendHandshakeBuffersLocked(buffers [][]byte, candidates []conn.Endpoint) error {
 	if peer.device.isClosed() {
 		return nil
 	}
@@ -488,7 +536,7 @@ func (peer *Peer) sendHandshakeBuffers(buffers [][]byte, candidates []conn.Endpo
 	var firstErr error
 	sent := false
 	for _, endpoint := range endpoints {
-		err := peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize)
+		err := peer.device.gsoFallbackResult(peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize))
 		if err == nil {
 			sent = true
 			peer.txBytes.Add(totalLen)

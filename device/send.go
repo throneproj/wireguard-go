@@ -273,11 +273,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	sendBuffer = append(sendBuffer, buf)
 
-	if len(candidates) > 0 {
-		err = peer.sendHandshakeBuffers(sendBuffer, candidates)
-	} else {
-		err = peer.SendBuffers(sendBuffer)
-	}
+	err = peer.sendHandshakeMessage(sendBuffer, candidates)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
 	}
@@ -336,7 +332,7 @@ func (peer *Peer) SendHandshakeResponse() error {
 	rand.Read(buf[offset+MessageResponseSize:])
 
 	// TODO: allocation could be avoided
-	err = peer.SendBuffers([][]byte{buf})
+	err = peer.sendHandshakeMessage([][]byte{buf}, nil)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
 	}
@@ -1104,7 +1100,7 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 
 	var err error
 	if len(scratch) > 0 {
-		err = peer.SendBuffers(scratch)
+		err = peer.sendTransportBuffers(scratch)
 	}
 	if dataSent {
 		peer.timersDataSent()
@@ -1113,13 +1109,6 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 	for _, elem := range elemsContainer.elems {
 		device.PutOutboundBuffer(elem.buffer)
 		device.PutOutboundElement(elem)
-	}
-	if err != nil {
-		var errGSO conn.ErrUDPGSODisabled
-		if errors.As(err, &errGSO) {
-			device.log.Verbosef(err.Error())
-			err = errGSO.RetryErr
-		}
 	}
 	if err != nil {
 		device.log.Errorf("%v - Failed to send data packets: %v", peer, err)
