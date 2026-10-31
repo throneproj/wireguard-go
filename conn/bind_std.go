@@ -586,6 +586,9 @@ retry:
 			clear(msg.Buffers[1:])
 			msg.Buffers = append(msg.Buffers[:0], bufs[i][offset:])
 			msg.Addr = ua
+			// and its UDP_SEGMENT cmsg, which setSrcControl does not clear where
+			// it is a no-op (Android): the retry would fail with EIO again.
+			msg.OOB = msg.OOB[:0]
 			setSrcControl(&msg.OOB, standardEndpoint)
 		}
 		err = s.send(conn, br, (*msgs)[:len(bufs)])
